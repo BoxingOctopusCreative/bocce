@@ -35,29 +35,39 @@ const (
 )
 
 var shaCryptB64 = []byte("./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+var version = "dev"
 
 type cliConfig struct {
 	templatePath   string
 	sshKeyPath     string
 	caCertPath     string
 	starshipPreset string
+	userName       string
 	ubuntuProToken string
 	password       string
 	salt           string
 	rounds         int
 	outputDir      string
+	dockerEnabled  bool
+	showVersion    bool
 }
 
 type templateData struct {
 	PasswordHash   string
 	SshKey         string
 	CaCert         string
+	UserName       string
 	StarshipPreset string
 	UbuntuProToken string
+	DockerEnabled  bool
 }
 
 func main() {
 	cfg := parseFlags()
+	if cfg.showVersion {
+		fmt.Println(version)
+		return
+	}
 	if err := run(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -66,17 +76,32 @@ func main() {
 
 func parseFlags() cliConfig {
 	var cfg cliConfig
+	toolName := filepath.Base(os.Args[0])
+	flag.CommandLine.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintf(out, "%s - Generate validated cloud-init user-data\n\n", toolName)
+		fmt.Fprintf(out, "Usage:\n  %s [options]\n\n", toolName)
+		fmt.Fprintln(out, "Required options:")
+		fmt.Fprintln(out, "  -ca-cert-path string")
+		fmt.Fprintln(out, "  -password string")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Options:")
+		flag.PrintDefaults()
+	}
 
 	flag.StringVar(&cfg.templatePath, "template", "templates/user-data.yaml.tmpl", "Path to cloud-config template")
 	flag.StringVar(&cfg.sshKeyPath, "ssh-key-path", "", "Path to SSH public key file")
 	flag.StringVar(&cfg.caCertPath, "ca-cert-path", "", "Path to CA certificate file")
 	flag.StringVar(&cfg.starshipPreset, "starship-preset", "nerd-font-symbols", "Starship preset name")
+	flag.StringVar(&cfg.userName, "user-name", "do-user", "User name")
 	flag.StringVar(&cfg.ubuntuProToken, "ubuntu-pro-token", "", "Ubuntu Pro token")
 	flag.StringVar(&cfg.password, "password", "", "Plaintext password to hash for cloud-init")
 	flag.StringVar(&cfg.salt, "salt", "", "Optional explicit salt for SHA-512-crypt")
 	flag.IntVar(&cfg.rounds, "rounds", defaultRounds, "SHA-512-crypt rounds (1000-999999999)")
 	flag.StringVar(&cfg.outputDir, "output-path", ".", "Output directory for rendered user-data.yaml")
 	flag.StringVar(&cfg.outputDir, "outputPath", ".", "Output directory for rendered user-data.yaml")
+	flag.BoolVar(&cfg.dockerEnabled, "docker-enabled", false, "Enable Docker")
+	flag.BoolVar(&cfg.showVersion, "version", false, "Print tool version and exit")
 	flag.Parse()
 
 	return cfg
@@ -122,7 +147,9 @@ func run(cfg cliConfig) error {
 		SshKey:         sshPublicKey,
 		CaCert:         indentMultiline(strings.TrimSpace(string(caCertBytes)), "      "),
 		StarshipPreset: cfg.starshipPreset,
+		UserName:       cfg.userName,
 		UbuntuProToken: strings.TrimSpace(cfg.ubuntuProToken),
+		DockerEnabled:  cfg.dockerEnabled,
 	}
 
 	validator, err := newCloudConfigValidator()
@@ -133,6 +160,7 @@ func run(cfg cliConfig) error {
 		PasswordHash:   "$6$testsalt$placeholderhash",
 		SshKey:         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBplaceholder generated-by-BOCCE",
 		CaCert:         indentMultiline("-----BEGIN CERTIFICATE-----\nMIIBplaceholder\n-----END CERTIFICATE-----", "      "),
+		UserName:       "do-user",
 		StarshipPreset: "nerd-font-symbols",
 		UbuntuProToken: "template-validation-token",
 	}
@@ -206,10 +234,11 @@ func normalizeTemplate(raw string) string {
 	replacer := strings.NewReplacer(
 		"{{ PasswordHash }}", "{{ .PasswordHash }}",
 		"{{ SshKey }}", "{{ .SshKey }}",
+		"{{ UserName }}", "{{ .UserName }}",
 		"{{ CaCert }}", "{{ .CaCert }}",
 		"{{ StarshipPreset }}", "{{ .StarshipPreset }}",
 		"{{ UbuntuProToken }}", "{{ .UbuntuProToken }}",
-		"{StarshipPreset}", "{{ .StarshipPreset }}",
+		"{{ DockerEnabled }}", "{{ .DockerEnabled }}",
 	)
 	return replacer.Replace(raw)
 }
@@ -263,7 +292,7 @@ func mkpasswdSHA512Crypt(password, salt string, rounds int) (string, error) {
 	final := mainCtx.Sum(nil)
 
 	dp := sha512.New()
-	for i := 0; i < len(passBytes); i++ {
+	for range len(passBytes) {
 		_, _ = dp.Write(passBytes)
 	}
 	dpSum := dp.Sum(nil)
@@ -282,7 +311,7 @@ func mkpasswdSHA512Crypt(password, salt string, rounds int) (string, error) {
 		copy(sSeq[i:], dsSum)
 	}
 
-	for i := 0; i < rounds; i++ {
+	for i := range rounds {
 		roundCtx := sha512.New()
 		if i%2 == 1 {
 			_, _ = roundCtx.Write(pSeq)
@@ -373,7 +402,7 @@ func encodeSHA512Crypt(final []byte) string {
 
 func b64From24Bit(out *strings.Builder, b2, b1, b0 byte, n int) {
 	w := uint32(b2)<<16 | uint32(b1)<<8 | uint32(b0)
-	for i := 0; i < n; i++ {
+	for range n {
 		out.WriteByte(shaCryptB64[w&0x3f])
 		w >>= 6
 	}
