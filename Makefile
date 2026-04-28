@@ -1,4 +1,4 @@
-APP_NAME := do-user-data-render
+APP_NAME := bocce
 DIST_DIR := dist
 MAIN_PKG := .
 
