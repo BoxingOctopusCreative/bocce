@@ -1,0 +1,54 @@
+#cloud-config
+package_upgrade: true
+packages:
+- zsh
+- ca-certificates
+- curl
+- apt-transport-https
+- gnupg
+- bat
+- fzf
+- neofetch
+- duf
+- eza
+
+users:
+  - name: do-user
+    groups: admin
+    shell: /bin/zsh
+    lock_passwd: false
+    passwd: {{ PasswordHash }}
+    ssh_authorized_keys:
+      - {{ SshKey }}
+
+ca_certs:
+  remove_defaults: false
+  trusted:
+    - |
+      {{ CaCert }}
+
+runcmd:
+  - update-ca-certificates
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  - chmod a+r /etc/apt/keyrings/docker.gpg
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - usermod -aG docker do-user
+  - echo 'PermitRootLogin no' >> /etc/ssh/sshd_config.d/50-root-login.conf
+  - curl -sS https://starship.rs/install.sh | sh -s -- -y
+  - echo 'eval "$(starship init zsh)"' >> /home/do-user/.zshrc
+  - echo 'eval "$(starship init zsh)"' >> /root/.zshrc
+  - echo 'alias ls="eza --icons=always"' >> /home/do-user/.zshrc
+  - echo 'alias ls="eza --icons=always"' >> /root/.zshrc
+  - echo 'alias cat="batcat"' >> /home/do-user/.zshrc
+  - echo 'alias cat="batcat"' >> /root/.zshrc
+  - echo 'alias fzf="fzf --height 40% --reverse --border"' >> /home/do-user/.zshrc
+  - echo 'alias fzf="fzf --height 40% --reverse --border"' >> /root/.zshrc
+  - echo 'alias df="duf"' >> /home/do-user/.zshrc
+  - echo 'alias df="duf"' >> /root/.zshrc
+  - sudo -u do-user mkdir -p /home/do-user/.config
+  - sudo -u root mkdir -p /root/.config
+  - sudo -u do-user starship preset {StarshipPreset} -o /home/do-user/.config/starship.toml
+  - sudo -u root starship preset {StarshipPreset} -o /root/.config/starship.toml

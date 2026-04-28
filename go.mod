@@ -1,3 +1,3 @@
-module boc-do-user-data
+module bocchi
 
 go 1.25
