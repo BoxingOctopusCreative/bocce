@@ -20,7 +20,11 @@ build-linux:
 	GOOS=linux GOARCH=arm64 go build -o $(DIST_DIR)/$(APP_NAME)-linux-arm64 $(MAIN_PKG)
 	GOOS=linux GOARCH=amd64 go build -o $(DIST_DIR)/$(APP_NAME)-linux-amd64 $(MAIN_PKG)
 
-build-all: build-macos build-linux
+build-windows:
+	mkdir -p $(DIST_DIR)
+	GOOS=windows GOARCH=amd64 go build -o $(DIST_DIR)/$(APP_NAME)-windows-amd64.exe $(MAIN_PKG)
+
+build-all: build-macos build-linux build-windows
 
 clean:
 	rm -rf $(DIST_DIR)
