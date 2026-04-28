@@ -1,21 +1,37 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha512"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
+	"time"
+
+	"github.com/santhosh-tekuri/jsonschema/v5"
+	"sigs.k8s.io/yaml"
 )
 
 const (
-	sha512Magic   = "$6$"
-	defaultRounds = 5000
-	minRounds     = 1000
-	maxRounds     = 999999999
+	sha512Magic       = "$6$"
+	defaultRounds     = 5000
+	minRounds         = 1000
+	maxRounds         = 999999999
+	cloudConfigSchema = "https://raw.githubusercontent.com/canonical/cloud-init/main/cloudinit/config/schemas/schema-cloud-config-v1.json"
+	schemaEnvPath     = "BOCCE_SCHEMA_PATH"
 )
 
 var shaCryptB64 = []byte("./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
@@ -25,10 +41,11 @@ type cliConfig struct {
 	sshKeyPath     string
 	caCertPath     string
 	starshipPreset string
+	ubuntuProToken string
 	password       string
 	salt           string
 	rounds         int
-	outputPath     string
+	outputDir      string
 }
 
 type templateData struct {
@@ -36,6 +53,7 @@ type templateData struct {
 	SshKey         string
 	CaCert         string
 	StarshipPreset string
+	UbuntuProToken string
 }
 
 func main() {
@@ -49,41 +67,43 @@ func main() {
 func parseFlags() cliConfig {
 	var cfg cliConfig
 
-	flag.StringVar(&cfg.templatePath, "template", "user-data.yaml.tmpl", "Path to cloud-config template")
+	flag.StringVar(&cfg.templatePath, "template", "templates/user-data.yaml.tmpl", "Path to cloud-config template")
 	flag.StringVar(&cfg.sshKeyPath, "ssh-key-path", "", "Path to SSH public key file")
 	flag.StringVar(&cfg.caCertPath, "ca-cert-path", "", "Path to CA certificate file")
 	flag.StringVar(&cfg.starshipPreset, "starship-preset", "nerd-font-symbols", "Starship preset name")
+	flag.StringVar(&cfg.ubuntuProToken, "ubuntu-pro-token", "", "Ubuntu Pro token")
 	flag.StringVar(&cfg.password, "password", "", "Plaintext password to hash for cloud-init")
 	flag.StringVar(&cfg.salt, "salt", "", "Optional explicit salt for SHA-512-crypt")
 	flag.IntVar(&cfg.rounds, "rounds", defaultRounds, "SHA-512-crypt rounds (1000-999999999)")
-	flag.StringVar(&cfg.outputPath, "output", "", "Output path (default stdout)")
+	flag.StringVar(&cfg.outputDir, "output-path", ".", "Output directory for rendered user-data.yaml")
+	flag.StringVar(&cfg.outputDir, "outputPath", ".", "Output directory for rendered user-data.yaml")
 	flag.Parse()
 
 	return cfg
 }
 
 func run(cfg cliConfig) error {
-	if cfg.sshKeyPath == "" {
-		return errors.New("missing required -ssh-key-path")
-	}
 	if cfg.caCertPath == "" {
 		return errors.New("missing required -ca-cert-path")
 	}
 	if cfg.password == "" {
 		return errors.New("missing required -password")
 	}
+	if err := os.MkdirAll(cfg.outputDir, 0o755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
 
 	tmplBytes, err := os.ReadFile(cfg.templatePath)
 	if err != nil {
 		return fmt.Errorf("read template: %w", err)
 	}
-	sshKeyBytes, err := os.ReadFile(cfg.sshKeyPath)
-	if err != nil {
-		return fmt.Errorf("read ssh key: %w", err)
-	}
 	caCertBytes, err := os.ReadFile(cfg.caCertPath)
 	if err != nil {
 		return fmt.Errorf("read ca cert: %w", err)
+	}
+	sshPublicKey, err := resolveSSHPublicKey(cfg)
+	if err != nil {
+		return err
 	}
 
 	hash, err := mkpasswdSHA512Crypt(cfg.password, cfg.salt, cfg.rounds)
@@ -99,9 +119,25 @@ func run(cfg cliConfig) error {
 
 	data := templateData{
 		PasswordHash:   hash,
-		SshKey:         strings.TrimSpace(string(sshKeyBytes)),
+		SshKey:         sshPublicKey,
 		CaCert:         indentMultiline(strings.TrimSpace(string(caCertBytes)), "      "),
 		StarshipPreset: cfg.starshipPreset,
+		UbuntuProToken: strings.TrimSpace(cfg.ubuntuProToken),
+	}
+
+	validator, err := newCloudConfigValidator()
+	if err != nil {
+		return fmt.Errorf("initialize cloud-config schema validator: %w", err)
+	}
+	templateValidationData := templateData{
+		PasswordHash:   "$6$testsalt$placeholderhash",
+		SshKey:         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBplaceholder generated-by-BOCCE",
+		CaCert:         indentMultiline("-----BEGIN CERTIFICATE-----\nMIIBplaceholder\n-----END CERTIFICATE-----", "      "),
+		StarshipPreset: "nerd-font-symbols",
+		UbuntuProToken: "template-validation-token",
+	}
+	if err := validateTemplateSchema(tmpl, templateValidationData, validator); err != nil {
+		return err
 	}
 
 	var output strings.Builder
@@ -109,14 +145,61 @@ func run(cfg cliConfig) error {
 		return fmt.Errorf("execute template: %w", err)
 	}
 
-	if cfg.outputPath == "" {
-		fmt.Print(output.String())
-		return nil
+	if err := validator.validateYAML(output.String()); err != nil {
+		return fmt.Errorf("generated cloud-config failed schema validation: %w", err)
 	}
-	if err := os.WriteFile(cfg.outputPath, []byte(output.String()), 0o644); err != nil {
+
+	outputPath := filepath.Join(cfg.outputDir, "user-data.yaml")
+	if err := os.WriteFile(outputPath, []byte(output.String()), 0o644); err != nil {
 		return fmt.Errorf("write output: %w", err)
 	}
 	return nil
+}
+
+func resolveSSHPublicKey(cfg cliConfig) (string, error) {
+	if cfg.sshKeyPath != "" {
+		sshKeyBytes, err := os.ReadFile(cfg.sshKeyPath)
+		if err != nil {
+			return "", fmt.Errorf("read ssh key: %w", err)
+		}
+		return strings.TrimSpace(string(sshKeyBytes)), nil
+	}
+	return generateEd25519KeyPair(cfg.outputDir)
+}
+
+func generateEd25519KeyPair(outputDir string) (string, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", fmt.Errorf("generate ed25519 keypair: %w", err)
+	}
+
+	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return "", fmt.Errorf("marshal private key: %w", err)
+	}
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+	privateKeyPath := filepath.Join(outputDir, "id_ed25519")
+	if err := os.WriteFile(privateKeyPath, privPEM, 0o600); err != nil {
+		return "", fmt.Errorf("write private key: %w", err)
+	}
+
+	publicKey := formatOpenSSHEd25519PublicKey(pub)
+	publicKeyPath := filepath.Join(outputDir, "id_ed25519.pub")
+	if err := os.WriteFile(publicKeyPath, []byte(publicKey+"\n"), 0o644); err != nil {
+		return "", fmt.Errorf("write public key: %w", err)
+	}
+
+	return publicKey, nil
+}
+
+func formatOpenSSHEd25519PublicKey(pub ed25519.PublicKey) string {
+	algo := []byte("ssh-ed25519")
+	var blob bytes.Buffer
+	_ = binary.Write(&blob, binary.BigEndian, uint32(len(algo)))
+	_, _ = blob.Write(algo)
+	_ = binary.Write(&blob, binary.BigEndian, uint32(len(pub)))
+	_, _ = blob.Write(pub)
+	return "ssh-ed25519 " + base64.StdEncoding.EncodeToString(blob.Bytes()) + " generated-by-BOCCE"
 }
 
 func normalizeTemplate(raw string) string {
@@ -124,6 +207,8 @@ func normalizeTemplate(raw string) string {
 		"{{ PasswordHash }}", "{{ .PasswordHash }}",
 		"{{ SshKey }}", "{{ .SshKey }}",
 		"{{ CaCert }}", "{{ .CaCert }}",
+		"{{ StarshipPreset }}", "{{ .StarshipPreset }}",
+		"{{ UbuntuProToken }}", "{{ .UbuntuProToken }}",
 		"{StarshipPreset}", "{{ .StarshipPreset }}",
 	)
 	return replacer.Replace(raw)
@@ -292,4 +377,77 @@ func b64From24Bit(out *strings.Builder, b2, b1, b0 byte, n int) {
 		out.WriteByte(shaCryptB64[w&0x3f])
 		w >>= 6
 	}
+}
+
+type cloudConfigValidator struct {
+	schema *jsonschema.Schema
+}
+
+func newCloudConfigValidator() (*cloudConfigValidator, error) {
+	schemaBytes, err := loadCloudConfigSchema()
+	if err != nil {
+		return nil, err
+	}
+
+	compiler := jsonschema.NewCompiler()
+	if err := compiler.AddResource("schema.json", strings.NewReader(string(schemaBytes))); err != nil {
+		return nil, fmt.Errorf("register schema resource: %w", err)
+	}
+	schema, err := compiler.Compile("schema.json")
+	if err != nil {
+		return nil, fmt.Errorf("compile schema: %w", err)
+	}
+	return &cloudConfigValidator{schema: schema}, nil
+}
+
+func loadCloudConfigSchema() ([]byte, error) {
+	if path := strings.TrimSpace(os.Getenv(schemaEnvPath)); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read schema from %s: %w", path, err)
+		}
+		return data, nil
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(cloudConfigSchema)
+	if err != nil {
+		return nil, fmt.Errorf("download schema: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download schema returned status %s", resp.Status)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read schema response: %w", err)
+	}
+	return data, nil
+}
+
+func validateTemplateSchema(tmpl *template.Template, data templateData, validator *cloudConfigValidator) error {
+	var rendered strings.Builder
+	if err := tmpl.Execute(&rendered, data); err != nil {
+		return fmt.Errorf("render template for validation: %w", err)
+	}
+	if err := validator.validateYAML(rendered.String()); err != nil {
+		return fmt.Errorf("template failed schema validation: %w", err)
+	}
+	return nil
+}
+
+func (v *cloudConfigValidator) validateYAML(content string) error {
+	jsonBytes, err := yaml.YAMLToJSON([]byte(content))
+	if err != nil {
+		return fmt.Errorf("convert YAML to JSON: %w", err)
+	}
+
+	var payload any
+	if err := json.Unmarshal(jsonBytes, &payload); err != nil {
+		return fmt.Errorf("decode JSON payload: %w", err)
+	}
+	if err := v.schema.Validate(payload); err != nil {
+		return err
+	}
+	return nil
 }

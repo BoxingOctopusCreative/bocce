@@ -50,5 +50,12 @@ runcmd:
   - echo 'alias df="duf"' >> /root/.zshrc
   - sudo -u do-user mkdir -p /home/do-user/.config
   - sudo -u root mkdir -p /root/.config
-  - sudo -u do-user starship preset {StarshipPreset} -o /home/do-user/.config/starship.toml
-  - sudo -u root starship preset {StarshipPreset} -o /root/.config/starship.toml
+  - sudo -u do-user starship preset {{ StarshipPreset }} -o /home/do-user/.config/starship.toml
+  - sudo -u root starship preset {{ StarshipPreset }} -o /root/.config/starship.toml
+
+{{ if .UbuntuProToken }}
+ubuntu_pro:
+  enable:
+    - livepatch
+  token: {{ .UbuntuProToken }}
+{{ end }}

@@ -2,7 +2,10 @@ APP_NAME := do-user-data-render
 DIST_DIR := dist
 MAIN_PKG := .
 
-.PHONY: build clean build-macos build-linux build-all
+.PHONY: test build clean build-macos build-linux build-all
+
+test:
+	go test ./...
 
 build:
 	go build -o $(DIST_DIR)/$(APP_NAME) $(MAIN_PKG)
