@@ -1,4 +1,5 @@
 {
     "snyk.advanced.organization": "814dcb10-3968-4548-9451-729f5e8c8498",
-    "snyk.advanced.autoSelectOrganization": true
+    "snyk.advanced.autoSelectOrganization": true,
+    "makefile.configureOnOpen": false
 }
